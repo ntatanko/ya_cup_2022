@@ -1,0 +1,39 @@
+{
+    "shortcuts": [
+        {
+            "command": "jupyterlab_code_formatter:format",
+            "keys": [
+                "Ctrl P"
+            ],
+            "selector": ".jp-Notebook"
+        },
+        {
+            "command": "jupyterlab_code_formatter:format_all",
+            "keys": [
+                "Ctrl O"
+            ],
+            "selector": "body"
+        },
+        {
+            "command": "jupyterlab_code_formatter:isort",
+            "keys": [
+                "Ctrl I"
+            ],
+            "selector": ".jp-Notebook"
+        },
+        {
+            "command": "notebook:restart-run-all",
+            "keys": [
+                "F5"
+            ],
+            "selector": ".jp-Notebook"
+        },
+        {
+            "command": "notebook:clear-cell-output",
+            "keys": [
+                "/", "/"
+            ],
+            "selector": "[data-jp-kernel-user]:focus"
+        }
+    ]
+}

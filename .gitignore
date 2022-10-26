@@ -1,0 +1,15 @@
+.git/
+.ipynb_checkpoints/
+.tensorboard/
+.keras/
+.virtual_documents/
+_data/
+_out/
+__*/
+__*.*
+kaggle.json
+docker/res/root/.jupyter/migrated
+tmp/
+core
+wandb/
+

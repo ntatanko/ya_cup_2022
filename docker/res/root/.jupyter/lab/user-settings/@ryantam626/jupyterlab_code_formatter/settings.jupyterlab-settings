@@ -1,0 +1,12 @@
+{
+    // Code Formatter Preferences
+    // Preferences for this plugin
+    "preferences": {
+        "default_formatter": {
+            "python": [
+                "isort",
+                "black"
+            ]
+        }
+    }
+}
