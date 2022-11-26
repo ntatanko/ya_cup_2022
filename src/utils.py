@@ -37,6 +37,7 @@ class DataGenerator(keras.utils.Sequence):
         n_chanels=1,
         shuffle=True,
         positive_label=0,
+        triplets = False
     ):
         self.data = data
         self.img_size = img_size
@@ -47,6 +48,8 @@ class DataGenerator(keras.utils.Sequence):
         self.positive_label = positive_label
         self.negative_label = 0 if self.positive_label == 1 else 1
         self.artist_ids = [x for x in self.data.keys()]
+        self.default_img_size = (512, 81)
+        self.triplets = triplets
         if self.shuffle:
             np.random.shuffle(self.artist_ids)
 
@@ -62,6 +65,9 @@ class DataGenerator(keras.utils.Sequence):
         if self.norm:
             img -= img.min()
             img /= img.max()
+        if self.img_size < self.default_img_size:
+            wpad = (img.shape[1] - self.img_size[1])//2
+            img = img[:, wpad: wpad + self.img_size[1]]
         if img.shape != self.img_size:
             wpad = self.img_size[1] - img.shape[1]
             wpad_l = wpad // 2
@@ -234,7 +240,7 @@ def make_callbacks(
             mode=mode,
         ),
         keras.callbacks.ModelCheckpoint(
-            os.path.join(path, "model.h5"),
+            os.path.join(path, "best"),
             monitor=monitor,
             verbose=1,
             save_best_only=True,
@@ -260,3 +266,243 @@ def make_callbacks(
     return callbacks
 
 
+class TripletsGenerator(keras.utils.Sequence):
+    def __init__(
+        self,
+        data,
+        img_size,
+        batch_size=32,
+        norm=False,
+        n_chanels=1,
+        shuffle=True,
+        debug=True,
+    ):
+        self.data = data.reset_index(drop=True)
+        self.img_size = img_size
+        self.batch_size = batch_size
+        self.norm = norm
+        self.n_chanels = n_chanels
+        self.shuffle = shuffle
+        self.artist_ids = self.data["artistid"].unique().tolist()
+        self.default_img_size = (512, 81)
+        self.artis2path = self.data.groupby("artistid").agg(list)["path"].to_dict()
+        self.paths = self.data["path"].tolist()
+        self.debug = debug
+        if self.shuffle:
+            np.random.shuffle(self.paths)
+
+    def __len__(self):
+        return self.data.shape[0] // self.batch_size
+
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.artist_ids)
+
+    def load_img(self, path):
+        img = np.load(path).astype("float32")
+        if self.norm:
+            img -= img.min()
+            img /= img.max()
+        if self.img_size < self.default_img_size:
+            wpad = (img.shape[1] - self.img_size[1]) // 2
+            img = img[:, wpad : wpad + self.img_size[1]]
+        if img.shape != self.img_size:
+            wpad = self.img_size[1] - img.shape[1]
+            wpad_l = wpad // 2
+            wpad_r = wpad - wpad_l
+            img = np.pad(
+                img,
+                pad_width=((0, 0), (wpad_l, wpad_r)),
+                mode="constant",
+                constant_values=0,
+            )
+        img = np.expand_dims(img, -1)
+        if self.n_chanels == 3:
+            img = np.concatenate([img, img, img], -1)
+        return img
+
+    def make_triplet(self):
+        art_pos, art_neg = rnd.sample(self.artist_ids, 2)
+        anchor_path, positive_path = rnd.sample(self.artis2path[art_pos], 2)
+        negative_path = rnd.sample(self.artis2path[art_neg], 1)[0]
+        anchor, positive, negative = [
+            self.load_img(path) for path in [anchor_path, positive_path, negative_path]
+        ]
+        if self.debug:
+            return (
+                (anchor, positive, negative),
+                (anchor_path, positive_path, negative_path),
+                (art_pos, art_neg),
+            )
+        else:
+            return (anchor, positive, negative)
+
+    def __getitem__(self, batch_ix):
+        imgs = {
+            "anchor": np.zeros([self.batch_size, *self.img_size, self.n_chanels]),
+            "positive": np.zeros([self.batch_size, *self.img_size, self.n_chanels]),
+            "negative": np.zeros([self.batch_size, *self.img_size, self.n_chanels]),
+        }
+        for i in range(self.batch_size):
+            (
+                imgs["anchor"][i, ...],
+                imgs["positive"][i, ...],
+                imgs["negative"][i, ...],
+            ) = self.make_triplet()
+
+        return imgs, np.zeros(self.batch_size)
+
+
+def plot_triplets(df, cfg, n_examples=5):
+    path2artist = df.set_index("path")["artistid"].to_dict()
+    generator = TripletsGenerator(
+        data=df,
+        img_size=cfg.img_size,
+        batch_size=cfg.batch_size,
+        norm=cfg.norm,
+        n_chanels=cfg.n_chanels,
+        shuffle=True,
+        debug=True,
+    )
+    plt.figure(figsize=(20, 2 * n_examples))
+    for i in range(n_examples):
+        imgs, paths, arts = generator.make_triplet()
+        artist_ids = [path2artist[p] for p in paths]
+        for j in range(3):
+            plt.subplot(n_examples, 3, 3 * i + j + 1)
+            plt.title(f"artist {artist_ids[j]}")
+            plt.imshow(np.squeeze(imgs[j], -1).transpose(1, 0))
+            plt.xticks([])
+            plt.yticks([])
+    plt.show()
+
+
+# class DataGenerator(keras.utils.Sequence):
+#     def __init__(
+#         self,
+#         data,
+#         img_size,
+#         batch_size=32,
+#         norm=False,
+#         n_chanels=1,
+#         shuffle=True,
+#         positive_label=0,
+#         triplets=False,
+#     ):
+#         self.data = data
+#         self.img_size = img_size
+#         self.batch_size = batch_size
+#         self.norm = norm
+#         self.n_chanels = n_chanels
+#         self.shuffle = shuffle
+#         self.positive_label = positive_label
+#         self.negative_label = 0 if self.positive_label == 1 else 1
+#         self.artist_ids = [x for x in self.data.keys()]
+#         self.default_img_size = (512, 81)
+#         self.triplets = triplets
+#         if self.shuffle:
+#             np.random.shuffle(self.artist_ids)
+
+#     def __len__(self):
+#         return len(self.artist_ids) // self.batch_size
+
+#     def on_epoch_end(self):
+#         if self.shuffle:
+#             np.random.shuffle(self.artist_ids)
+
+#     def load_img(self, path):
+#         img = np.load(path).astype("float32")
+#         if self.norm:
+#             img -= img.min()
+#             img /= img.max()
+#         if self.img_size < self.default_img_size:
+#             wpad = (img.shape[1] - self.img_size[1]) // 2
+#             img = img[:, wpad : wpad + self.img_size[1]]
+#         if img.shape != self.img_size:
+#             wpad = self.img_size[1] - img.shape[1]
+#             wpad_l = wpad // 2
+#             wpad_r = wpad - wpad_l
+#             img = np.pad(
+#                 img,
+#                 pad_width=((0, 0), (wpad_l, wpad_r)),
+#                 mode="constant",
+#                 constant_values=0,
+#             )
+#         img = np.expand_dims(img, -1)
+#         if self.n_chanels == 3:
+#             img = np.concatenate([img, img, img], -1)
+#         return img
+
+#     def make_pair(self, ix, same_artist=True):
+#         artist_id = self.artist_ids[ix]
+#         if self.data[artist_id]["count"] < 2:
+#             same_artist = False
+#         if same_artist:
+#             path1, path2 = rnd.sample(self.data[artist_id]["paths"], 2)
+#         else:
+#             path1 = rnd.sample(self.data[artist_id]["paths"], 1)[0]
+#             new_artist_id = artist_id
+#             while artist_id == new_artist_id:
+#                 new_artist_id = rnd.sample(self.artist_ids, 1)[0]
+#                 path2 = rnd.sample(self.data[new_artist_id]["paths"], 1)[0]
+#         return same_artist, (path1, path2)
+
+#     def make_triplet(self, ix):
+#         artist_id = self.artist_ids[ix]
+#         if self.data[artist_id]["count"] >= 2:
+#             paths = rnd.sample(self.data[artist_id]["paths"], 2)
+#         elif self.data[artist_id]["count"] == 1:
+#             paths = self.data[artist_id]["paths"]
+#         if len(paths) == 1:
+#             n_neg_samples = 2
+#             labels = [0, 0]
+#         else:
+#             n_neg_samples = 1
+#             labels = [1, 0]
+#         new_artist_ids = [artist_id]
+#         while artist_id in new_artist_ids:
+#             new_artist_ids = rnd.sample(self.artist_ids, n_neg_samples)
+#             neg_paths = [
+#                 rnd.sample(self.data[new_artist_id]["paths"], 1)[0]
+#                 for new_artist_id in new_artist_ids
+#             ]
+#         paths.extend(neg_paths)
+#         if np.random.random() > 0.5:
+#             paths = [paths[0], paths[2], paths[1]]
+#             labels = [labels[1], labels[0]]
+#         return labels, paths
+
+#     def _get_one(self, ix, same_artist):
+#         if self.triplets:
+#             labels, paths = self.make_triplet(ix)
+#             imgs = [self.load_img(path) for path in paths]
+#             y = labels
+#         else:
+#             upd_same_artist, paths = self.make_pair(ix=ix, same_artist=same_artist)
+#             imgs = [self.load_img(path) for path in paths]
+#             y = self.positive_label if upd_same_artist else self.negative_label
+#         return np.array(imgs), y
+
+#     def __getitem__(self, batch_ix):
+#         n_imgs = 3 if self.triplets else 2
+#         n_labels = 2 if self.triplets else 1
+#         b_X = np.zeros(
+#             (
+#                 self.batch_size,
+#                 n_imgs,
+#                 self.img_size[0],
+#                 self.img_size[1],
+#                 self.n_chanels,
+#             ),
+#             dtype=np.float32,
+#         )
+#         b_Y = np.zeros(
+#             (self.batch_size, n_labels),
+#             dtype=np.float32,
+#         )
+#         for i in range(self.batch_size):
+#             b_X[i], b_Y[i] = self._get_one(
+#                 ix=i + self.batch_size * batch_ix, same_artist=np.random.random() > 0.5
+#             )
+#         # return b_X, b_Y
+#         return {f"img{i}": b_X[:, i - 1, :, :] for i in range(1, n_imgs + 1)}, b_Y

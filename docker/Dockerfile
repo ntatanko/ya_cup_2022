@@ -104,7 +104,7 @@ RUN pip install tables
 RUN pip install tfa-nightly
 RUN pip install pillow
 RUN pip install onnx
-
+RUN pip install annoy
 
 # tmp fix for https://github.com/jupyterlab/jupyterlab/issues/10228
 RUN jupyter server extension disable nbclassic
