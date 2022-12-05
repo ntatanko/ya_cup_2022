@@ -15,6 +15,7 @@
 # +
 import os
 import random as rnd
+import json
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -23,178 +24,36 @@ from IPython.core.interactiveshell import InteractiveShell
 from tensorflow import keras
 
 InteractiveShell.ast_node_interactivity = "all"
+from sklearn.model_selection import KFold
+import annoy
+import albumentations as A
+from tqdm import tqdm
 
 
 # -
 
-class DataGenerator(keras.utils.Sequence):
-    def __init__(
-        self,
-        data,
-        img_size,
-        batch_size=32,
-        norm=False,
-        n_chanels=1,
-        shuffle=True,
-        positive_label=0,
-        triplets = False
+
+def train_val_split(df, fold, n_splits=8, seed=42, data_dir = "/app/_data/artist_data/"):
+    df["path"] = df["archive_features_path"].apply(
+        lambda x: os.path.join(data_dir, "train_features", x)
+    )
+    gkf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    for n, (train_artist_ids, val_artist_ids) in enumerate(
+        gkf.split(
+            X=df["artistid"].unique().tolist(),
+        )
     ):
-        self.data = data
-        self.img_size = img_size
-        self.batch_size = batch_size
-        self.norm = norm
-        self.n_chanels = n_chanels
-        self.shuffle = shuffle
-        self.positive_label = positive_label
-        self.negative_label = 0 if self.positive_label == 1 else 1
-        self.artist_ids = [x for x in self.data.keys()]
-        self.default_img_size = (512, 81)
-        self.triplets = triplets
-        if self.shuffle:
-            np.random.shuffle(self.artist_ids)
+        df.loc[df.query('artistid in @val_artist_ids').index, 'fold'] = n
+    train_df = df[df["fold"] != fold].reset_index(drop=True).copy()
+    val_df = df[df["fold"] == fold].reset_index(drop=True).copy()
+    return train_df, val_df
 
-    def __len__(self):
-        return len(self.artist_ids) // self.batch_size
-
-    def on_epoch_end(self):
-        if self.shuffle:
-            np.random.shuffle(self.artist_ids)
-
-    def load_img(self, path):
-        img = np.load(path).astype("float32")
-        if self.norm:
-            img -= img.min()
-            img /= img.max()
-        if self.img_size < self.default_img_size:
-            wpad = (img.shape[1] - self.img_size[1])//2
-            img = img[:, wpad: wpad + self.img_size[1]]
-        if img.shape != self.img_size:
-            wpad = self.img_size[1] - img.shape[1]
-            wpad_l = wpad // 2
-            wpad_r = wpad - wpad_l
-            img = np.pad(
-                img,
-                pad_width=((0, 0), (wpad_l, wpad_r)),
-                mode="constant",
-                constant_values=0,
-            )
-        img = np.expand_dims(img, -1)
-        if self.n_chanels == 3:
-            img = np.concatenate([img, img, img], -1)
-        return img
-
-    def make_pair(self, ix, same_artist=True):
-        artist_id = self.artist_ids[ix]
-        if self.data[artist_id]["count"] < 2:
-            same_artist = False
-        if same_artist:
-            path1, path2 = rnd.sample(self.data[artist_id]["paths"], 2)
-        else:
-            path1 = rnd.sample(self.data[artist_id]["paths"], 1)[0]
-            new_artist_id = artist_id
-            while artist_id == new_artist_id:
-                new_artist_id = rnd.sample(self.artist_ids, 1)[0]
-                path2 = rnd.sample(self.data[new_artist_id]["paths"], 1)[0]
-        return same_artist, (path1, path2)
-
-    def _get_one(self, ix, same_artist):
-        upd_same_artist, (path1, path2) = self.make_pair(
-            ix=ix,
-            same_artist=same_artist
-        )
-        img1 = self.load_img(path1)
-        img2 = self.load_img(path2)
-        y = self.positive_label if upd_same_artist else self.negative_label
-        return (img1, img2), y
-
-    def __getitem__(self, batch_ix):
-        b_X1 = np.zeros(
-            (self.batch_size, self.img_size[0], self.img_size[1], self.n_chanels),
-            dtype=np.float32,
-        )
-        b_X2 = np.zeros(
-            (self.batch_size, self.img_size[0], self.img_size[1], self.n_chanels),
-            dtype=np.float32,
-        )
-        b_Y = np.zeros(
-            self.batch_size,
-            dtype=np.float32,
-        )
-        for i in range(self.batch_size):
-            (b_X1[i], b_X2[i]), b_Y[i] = self._get_one(
-                ix=i + self.batch_size * batch_ix,
-                same_artist=np.random.random() > 0.5
-            )
-
-        return {"img1": b_X1, "img2": b_X2}, b_Y
 
 
 def euclidean_distance(vects):
     x, y = vects
     sum_square = tf.math.reduce_sum(tf.math.square(x - y), axis=1, keepdims=True)
     return tf.math.sqrt(tf.math.maximum(sum_square, tf.keras.backend.epsilon()))
-
-
-def construct_embedding_model(
-    input,
-    embedding_len=1024,
-    n_blocks=4,
-    kernel_size=(10, 3),
-    activation_fn="relu",
-    batch_norm=False,
-):
-    depth_vector = 2 ** ((np.arange(n_blocks) + 1) * 2)
-
-    def base_block(x, i):
-        x = keras.layers.Conv2D(
-            filters=depth_vector[i],
-            kernel_size=kernel_size,
-            activation=activation_fn,
-            name=f"Conv2D_{i + 1}",
-        )(x)
-        x = keras.layers.AveragePooling2D(pool_size=(2, 2), name=f"avg_pool_{i + 1}")(x)
-        return x
-
-    if batch_norm:
-        x = keras.layers.BatchNormalization()(input)
-    else:
-        x = input
-    for i in range(n_blocks):
-        x = base_block(x, i)
-    x = keras.layers.Flatten(name="flatten")(x)
-    x = keras.layers.Dense(
-        embedding_len, activation=activation_fn, name=f"dense_{embedding_len}"
-    )(x)
-    embedding_net = keras.Model(inputs=input, outputs=x, name=f"embedding")
-    return embedding_net
-
-
-def make_model(
-    input_shape=(512, 81, 1),
-    n_blocks=4,
-    kernel_size=(10, 3),
-    embedding_len=1024,
-    activation_fn="relu",
-    batch_norm=False,
-):
-    base_model = construct_embedding_model(
-        keras.layers.Input(input_shape),
-        embedding_len=embedding_len,
-        n_blocks=n_blocks,
-        kernel_size=kernel_size,
-        activation_fn=activation_fn,
-        batch_norm=batch_norm,
-    )
-
-    input_1 = keras.layers.Input(input_shape, name="img1")
-    input_2 = keras.layers.Input(input_shape, name="img2")
-    node1 = base_model(input_1)
-    node2 = base_model(input_2)
-
-    merge_layer = keras.layers.Lambda(euclidean_distance)([node1, node2])
-    output_layer = keras.layers.Dense(1, activation="sigmoid")(merge_layer)
-    siamese = keras.Model(inputs=[input_1, input_2], outputs=output_layer)
-    return siamese
 
 
 def loss(margin=1):
@@ -240,17 +99,17 @@ def make_callbacks(
             mode=mode,
         ),
         keras.callbacks.ModelCheckpoint(
-            os.path.join(path, "best"),
+            os.path.join(path, "best.h5"),
             monitor=monitor,
             verbose=1,
             save_best_only=True,
-            save_weights_only=False,
+            save_weights_only=True,
             mode=mode,
             save_freq="epoch",
         ),
         keras.callbacks.ReduceLROnPlateau(
             monitor=monitor,
-            factor=0.9,
+            factor=0.7,
             patience=reduce_patience,
             verbose=1,
             mode=mode,
@@ -377,132 +236,315 @@ def plot_triplets(df, cfg, n_examples=5):
     plt.show()
 
 
-# class DataGenerator(keras.utils.Sequence):
-#     def __init__(
-#         self,
-#         data,
-#         img_size,
-#         batch_size=32,
-#         norm=False,
-#         n_chanels=1,
-#         shuffle=True,
-#         positive_label=0,
-#         triplets=False,
-#     ):
-#         self.data = data
-#         self.img_size = img_size
-#         self.batch_size = batch_size
-#         self.norm = norm
-#         self.n_chanels = n_chanels
-#         self.shuffle = shuffle
-#         self.positive_label = positive_label
-#         self.negative_label = 0 if self.positive_label == 1 else 1
-#         self.artist_ids = [x for x in self.data.keys()]
-#         self.default_img_size = (512, 81)
-#         self.triplets = triplets
-#         if self.shuffle:
-#             np.random.shuffle(self.artist_ids)
+class ImageLoader:
+    def __init__(
+        self, target_size, augment=True, center_crop=False, norm=False, n_channels=None
+    ):
+        self.target_size = target_size
+        self.augment = augment
+        self.center_crop = center_crop
+        self.norm = norm
+        self.n_channels = n_channels
 
-#     def __len__(self):
-#         return len(self.artist_ids) // self.batch_size
+    def reshape_img(self, img):
+        if img.shape[:2] < self.target_size:
+            """img = A.PadIfNeeded(
+                min_height=512,
+                min_width=81,
+                border_mode=3,
+                always_apply=True,
+            )(image=img)["image"]"""
+            pad_width = self.target_size[1] - img.shape[1]
+            pad_start = np.random.randint(img.shape[1] - pad_width)
+            pad_chunk = img[:, pad_start : pad_start + pad_width]
+            img = np.concatenate([img, pad_chunk], axis=1)
+        elif img.shape[:2] > self.target_size:
+            if self.center_crop:
+                img = A.CenterCrop(
+                    always_apply=True,
+                    height=self.target_size[0],
+                    width=self.target_size[1],
+                )(image=img)["image"]
+            else:
+                img = A.RandomCrop(
+                    always_apply=True,
+                    height=self.target_size[0],
+                    width=self.target_size[1],
+                )(image=img)["image"]
+        return img
 
-#     def on_epoch_end(self):
-#         if self.shuffle:
-#             np.random.shuffle(self.artist_ids)
+    def augment_fn(self, img):
+        transform = A.Compose(
+            [
+                A.Flip(p=0.2),
+                A.PixelDropout(p=0.1, dropout_prob=0.01),
+                A.CoarseDropout(
+                    p=0.1,
+                    max_holes=20,
+                    max_height=5,
+                    max_width=3,
+                    min_holes=1,
+                    min_height=2,
+                    min_width=2,
+                ),
+                A.RandomGridShuffle(p=0.3, grid=(1, 6)),
+            ]
+        )
+        return transform(image=img)["image"]
 
-#     def load_img(self, path):
-#         img = np.load(path).astype("float32")
-#         if self.norm:
-#             img -= img.min()
-#             img /= img.max()
-#         if self.img_size < self.default_img_size:
-#             wpad = (img.shape[1] - self.img_size[1]) // 2
-#             img = img[:, wpad : wpad + self.img_size[1]]
-#         if img.shape != self.img_size:
-#             wpad = self.img_size[1] - img.shape[1]
-#             wpad_l = wpad // 2
-#             wpad_r = wpad - wpad_l
-#             img = np.pad(
-#                 img,
-#                 pad_width=((0, 0), (wpad_l, wpad_r)),
-#                 mode="constant",
-#                 constant_values=0,
-#             )
-#         img = np.expand_dims(img, -1)
-#         if self.n_chanels == 3:
-#             img = np.concatenate([img, img, img], -1)
-#         return img
+    def load_img(self, path):
+        img = np.load(path)
+        img = self.reshape_img(img)
+        if self.norm:
+            img -= img.min()
+            img /= img.max()
+        if self.augment:
+            img = self.augment_fn(img)
+        if self.n_channels == 1:
+            img = np.expand_dims(img, -1)
+        return img
 
-#     def make_pair(self, ix, same_artist=True):
-#         artist_id = self.artist_ids[ix]
-#         if self.data[artist_id]["count"] < 2:
-#             same_artist = False
-#         if same_artist:
-#             path1, path2 = rnd.sample(self.data[artist_id]["paths"], 2)
-#         else:
-#             path1 = rnd.sample(self.data[artist_id]["paths"], 1)[0]
-#             new_artist_id = artist_id
-#             while artist_id == new_artist_id:
-#                 new_artist_id = rnd.sample(self.artist_ids, 1)[0]
-#                 path2 = rnd.sample(self.data[new_artist_id]["paths"], 1)[0]
-#         return same_artist, (path1, path2)
 
-#     def make_triplet(self, ix):
-#         artist_id = self.artist_ids[ix]
-#         if self.data[artist_id]["count"] >= 2:
-#             paths = rnd.sample(self.data[artist_id]["paths"], 2)
-#         elif self.data[artist_id]["count"] == 1:
-#             paths = self.data[artist_id]["paths"]
-#         if len(paths) == 1:
-#             n_neg_samples = 2
-#             labels = [0, 0]
-#         else:
-#             n_neg_samples = 1
-#             labels = [1, 0]
-#         new_artist_ids = [artist_id]
-#         while artist_id in new_artist_ids:
-#             new_artist_ids = rnd.sample(self.artist_ids, n_neg_samples)
-#             neg_paths = [
-#                 rnd.sample(self.data[new_artist_id]["paths"], 1)[0]
-#                 for new_artist_id in new_artist_ids
-#             ]
-#         paths.extend(neg_paths)
-#         if np.random.random() > 0.5:
-#             paths = [paths[0], paths[2], paths[1]]
-#             labels = [labels[1], labels[0]]
-#         return labels, paths
+class PairsGenerator(keras.utils.Sequence):
+    def __init__(
+        self,
+        df,
+        img_loader,
+        batch_size=32,
+        shuffle=True,
+        positive_label=0,
+        triplets=False,
+    ):
+        self.df = df
+        self.img_loader = img_loader
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.positive_label = positive_label
+        self.negative_label = 0 if self.positive_label == 1 else 1
+        self.artist_ids = self.df["artistid"].unique().tolist()
+        self.artist2paths = self.df.groupby("artistid").agg(list)["path"].to_dict()
+        if self.shuffle:
+            np.random.shuffle(self.artist_ids)
 
-#     def _get_one(self, ix, same_artist):
-#         if self.triplets:
-#             labels, paths = self.make_triplet(ix)
-#             imgs = [self.load_img(path) for path in paths]
-#             y = labels
-#         else:
-#             upd_same_artist, paths = self.make_pair(ix=ix, same_artist=same_artist)
-#             imgs = [self.load_img(path) for path in paths]
-#             y = self.positive_label if upd_same_artist else self.negative_label
-#         return np.array(imgs), y
+    def __len__(self):
+        return len(self.artist_ids) // self.batch_size
 
-#     def __getitem__(self, batch_ix):
-#         n_imgs = 3 if self.triplets else 2
-#         n_labels = 2 if self.triplets else 1
-#         b_X = np.zeros(
-#             (
-#                 self.batch_size,
-#                 n_imgs,
-#                 self.img_size[0],
-#                 self.img_size[1],
-#                 self.n_chanels,
-#             ),
-#             dtype=np.float32,
-#         )
-#         b_Y = np.zeros(
-#             (self.batch_size, n_labels),
-#             dtype=np.float32,
-#         )
-#         for i in range(self.batch_size):
-#             b_X[i], b_Y[i] = self._get_one(
-#                 ix=i + self.batch_size * batch_ix, same_artist=np.random.random() > 0.5
-#             )
-#         # return b_X, b_Y
-#         return {f"img{i}": b_X[:, i - 1, :, :] for i in range(1, n_imgs + 1)}, b_Y
+    def on_epoch_end(self):
+        if self.shuffle:
+            np.random.shuffle(self.artist_ids)
+
+    def make_pair(self, ix):
+        artist_id = self.artist_ids[ix]
+        if np.random.rand() > 0.5 and len(self.artist2paths[artist_id]) >= 2:
+            path1, path2 = rnd.sample(self.artist2paths[artist_id], 2)
+            label = self.positive_label
+        else:
+            path1 = rnd.sample(self.artist2paths[artist_id], 1)[0]
+            new_artist_id = rnd.sample(
+                [x for x in self.artist_ids if x != artist_id], 1
+            )[0]
+            path2 = rnd.sample(self.artist2paths[new_artist_id], 1)[0]
+            label = self.negative_label
+        imgs = [self.img_loader.load_img(x) for x in [path1, path2]]
+        return imgs, label
+
+    def __getitem__(self, batch_ix):
+        X1, X2, Y = [], [], []
+        for i in range(self.batch_size):
+            (img1, img2), label = self.make_pair(ix=i + self.batch_size * batch_ix)
+            X1.append(img1)
+            X2.append(img2)
+            Y.append(label)
+        return {"img1": np.array(X1), "img2": np.array(X2)}, np.array(Y, dtype= 'float32')
+
+
+class TestLoader(keras.utils.Sequence):
+    def __init__(self, df, data_loader):
+        self.df = df.reset_index(drop=True)
+        self.data_loader = data_loader
+        self.batch_size = 1
+        self.track_ids = self.df["trackid"].tolist()
+        self.track2path = self.df.set_index("trackid")["path"].to_dict()
+
+    def __len__(self):
+        return self.df.shape[0]
+
+    def __getitem__(self, batch_ix):
+        track_id = self.track_ids[batch_ix]
+        img = self.data_loader.load_img(self.track2path[track_id])
+        return np.expand_dims(img, 0), track_id
+
+
+def tf_inference(model, loader):
+    track_ids = loader.track_ids
+    tracks_embeds = model.predict(loader)
+    embeds = {k: v for k, v in zip(track_ids, tracks_embeds)}
+    return embeds
+
+
+def get_ranked_list(embeds, top_size=100, annoy_num_trees=128, annoy_metric="angular"):
+    annoy_index = None
+    annoy2id = []
+    id2annoy = dict()
+    for track_id, track_embed in tqdm(embeds.items()):
+        id2annoy[track_id] = len(annoy2id)
+        annoy2id.append(track_id)
+        if annoy_index is None:
+            annoy_index = annoy.AnnoyIndex(len(track_embed), annoy_metric)
+        annoy_index.add_item(id2annoy[track_id], track_embed)
+    annoy_index.build(annoy_num_trees, n_jobs=-1)
+    ranked_list = dict()
+    for track_id in tqdm(embeds.keys()):
+        candidates = annoy_index.get_nns_by_item(id2annoy[track_id], top_size + 1)[1:]
+        candidates = list(filter(lambda x: x != id2annoy[track_id], candidates))
+        ranked_list[track_id] = [annoy2id[candidate] for candidate in candidates]
+    return ranked_list
+
+
+def position_discounter(position):
+    return 1.0 / np.log2(position + 1)
+
+
+def get_ideal_dcg(relevant_items_count, top_size):
+    dcg = 0.0
+    for result_indx in range(min(top_size, relevant_items_count)):
+        position = result_indx + 1
+        dcg += position_discounter(position)
+    return dcg
+
+
+def compute_dcg(query_trackid, ranked_list, track2artist, top_size):
+    query_artistid = track2artist[query_trackid]
+    dcg = 0.0
+    for result_indx, result_trackid in enumerate(ranked_list[:top_size]):
+        assert result_trackid != query_trackid
+        position = result_indx + 1
+        discounted_position = position_discounter(position)
+        result_artistid = track2artist[result_trackid]
+        if result_artistid == query_artistid:
+            dcg += discounted_position
+    return dcg
+
+
+def eval_submission(submission, val_df, top_size=100):
+    track2artist = val_df.set_index("trackid")["artistid"].to_dict()
+    artist2tracks = val_df.groupby("artistid").agg(list)["trackid"].to_dict()
+    ndcg_list = []
+    for query_trackid in tqdm(submission.keys()):
+        ranked_list = submission[query_trackid]
+        query_artistid = track2artist[query_trackid]
+        query_artist_tracks_count = len(artist2tracks[query_artistid])
+        ideal_dcg = get_ideal_dcg(query_artist_tracks_count - 1, top_size=top_size)
+        dcg = compute_dcg(query_trackid, ranked_list, track2artist, top_size=top_size)
+        try:
+            ndcg_list.append(dcg / ideal_dcg)
+        except ZeroDivisionError:
+            continue
+    return np.mean(ndcg_list)
+
+
+def compute_val_dcg(model, df, cfg, annoy_metric="angular"):
+    features_loader = TestLoader(
+        df=df,
+        data_loader=ImageLoader(
+            target_size=cfg.img_size,
+            augment=False,
+            center_crop=cfg.center_crop,
+            norm=cfg.norm,
+            n_channels=cfg.n_channels,
+        ),
+    )
+    print("Making prediction")
+    embeds = tf_inference(model, features_loader)
+    print("\nComputing ranked list")
+    ranked_list = get_ranked_list(
+        embeds=embeds, top_size=100, annoy_num_trees=128, annoy_metric=annoy_metric
+    )
+    print("\nCalculating NDCG")
+    val_ndcg = eval_submission(
+        ranked_list,
+        df,
+        top_size=100,
+    )
+    print(f"\nNDCG on val set = {val_ndcg:.5f}")
+
+def save_params(
+    mod_dir, model, history, cfg, loss_name="contrastive_loss", metric="acc"
+):
+    train_history = history.history
+    if metric == "loss":
+        min_val_loss_ix = np.argmin(train_history["val_loss"])
+        max_acc = train_history["val_accuracy"][min_val_loss_ix]
+    elif metric == "acc":
+        max_acc = np.max(train_history["val_accuracy"])
+    for k in train_history.keys():
+        train_history[k] = list(map(float, train_history[k]))
+    model.save(
+        os.path.join(mod_dir, f"model_{int(np.round(max_acc * 1000))}.h5"),
+        include_optimizer=False,
+        save_traces=False,
+    )
+    config = {
+        "loss": loss_name,
+        "pos_label": cfg.pos_label,
+        "history": train_history,
+        "norm": cfg.norm,
+        "fold": cfg.fold,
+        "model": {
+            "input_shape": cfg.input_shape,
+            "embedding_len": cfg.emb_len,
+            "kernel_size": cfg.kernel_size,
+            "activation_fn": cfg.act_fn,
+            "batch_norm": cfg.batch_norm,
+            "n_channels": cfg.n_channels,
+            "center_crop": cfg.center_crop,
+        },
+    }
+    with open(os.path.join(mod_dir, "config.json"), "w") as f:
+        json.dump(config, f)
+    print(
+        f'\nMax_acc = {max_acc}, model saved to {os.path.join(mod_dir, f"model_{int(np.round(max_acc * 1000))}.h5")}'
+    )
+
+
+def save_submission(
+    model,
+    test_df,
+    cfg,
+    submission_path,
+    annoy_metric="angular",
+    top_size=100,
+    annoy_num_trees=256,
+):
+    submission_path = os.path.join(submission_path, f"submission_{top_size}.txt")
+    test_df["path"] = test_df["archive_features_path"].apply(
+        lambda x: os.path.join("/app/_data/artist_data/", "test_features", x)
+    )
+    features_loader = TestLoader(
+        df=test_df,
+        data_loader=ImageLoader(
+            target_size=cfg.img_size,
+            augment=False,
+            center_crop=cfg.center_crop,
+            norm=cfg.norm,
+            n_channels=cfg.n_channels,
+        ),
+    )
+    print("Making prediction")
+    embeds = tf_inference(model, features_loader)
+    print("\nComputing ranked list")
+    ranked_list = get_ranked_list(
+        embeds=embeds,
+        top_size=top_size,
+        annoy_num_trees=annoy_num_trees,
+        annoy_metric=annoy_metric,
+    )
+
+    with open(submission_path, "w") as f:
+        for query_trackid, result in ranked_list.items():
+            f.write(
+                "{}\t{}\n".format(query_trackid, " ".join(map(str, result[:top_size])))
+            )
+    print(f"\nSubmission file saved to {submission_path}")
+
+
