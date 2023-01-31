@@ -14,77 +14,18 @@ import torch.nn.functional as F
 from sklearn.model_selection import KFold
 from tqdm import tqdm
 
-
-def train_val_split(df, fold, n_splits=10, seed=42, data_dir = "/app/_data/artist_data/"):
-    df["path"] = df["archive_features_path"].apply(
-        lambda x: os.path.join(data_dir, "train_features", x)
-    )
-    gkf = KFold(n_splits=n_splits, shuffle=True, random_state=seed)
-    for n, (train_artist_ids, val_artist_ids) in enumerate(
-        gkf.split(
-            X=df["artistid"].unique().tolist(),
-        )
-    ):
-        df.loc[df.query('artistid in @val_artist_ids').index, 'fold'] = n
-    train_df = df[df["fold"] != fold].reset_index(drop=True).copy()
-    val_df = df[df["fold"] == fold].reset_index(drop=True).copy()
-    return train_df, val_df
-
-
-class FeaturesLoader:
-    def __init__(
-        self, features_dir_path, df, device="cpu", augment=False, crop_size=60
-    ):
-        self.features_dir_path = features_dir_path
-        self.df = df
-        self.df["path"] = self.df["archive_features_path"].apply(
-            lambda x: os.path.join(features_dir_path, x)
-        )
-        self.trackid2path = df.set_index("trackid")["path"].to_dict()
-        self.crop_size = crop_size
-        self.device = device
-        self.augment = augment
-
-    def augment_fn(self, img):
-        transform = A.Compose(
-            [
-                A.RandomCrop(always_apply=True, p=1.0, height=512, width=60),
-                A.Flip(p=0.2),
-                A.PixelDropout(p=0.1, dropout_prob=0.01),
-                A.CoarseDropout(
-                    p=0.1,
-                    max_holes=11,
-                    max_height=5,
-                    max_width=3,
-                    min_holes=1,
-                    min_height=2,
-                    min_width=2,
-                ),
-                A.RandomGridShuffle(p=0.3, grid=(1, 6)),
-            ]
-        )
-        return transform(image=img)["image"]
-
-    def _load_item(self, track_id):
-        img = np.load(self.trackid2path[track_id])
-        if not self.augment:
-            padding = (img.shape[1] - self.crop_size) // 2
-            img = img[:, padding : padding + self.crop_size]
-        else:
-            img = self.augment_fn(img)
-        return img
-
-    def load_batch(self, tracks_ids):
-        batch = [self._load_item(track_id) for track_id in tracks_ids]
-        return torch.tensor(np.array(batch)).to(self.device)
+from src.data_utils import ImageLoader, train_val_split
+from src.utils import eval_submission, get_ranked_list
 
 
 class TrainLoader:
-    def __init__(self, features_loader, batch_size=256, features_size=(512, 60)):
+    def __init__(self, df, features_loader, batch_size=256, device="cpu"):
+        self.df = df
         self.features_loader = features_loader
         self.batch_size = batch_size
-        self.features_size = features_size
-        self.artist_track_ids = self.features_loader.df.groupby("artistid").agg(list)
+        self.device = device
+        self.artist_track_ids = self.df.groupby("artistid").agg(list)
+        self.track2path = self.df.set_index("trackid")["path"].to_dict()
 
     def _generate_pairs(self, track_ids):
         np.random.shuffle(track_ids)
@@ -100,10 +41,19 @@ class TrainLoader:
         np.random.shuffle(pairs)
         return pairs
 
+    def load_batch(self, tracks_ids):
+        batch = [
+            self.features_loader.load_img(self.track2path[track_id])
+            for track_id in tracks_ids
+        ]
+        return torch.tensor(np.array(batch)).to(self.device)
+
     def _get_batch(self, batch_ids):
         batch_ids = np.array(batch_ids).reshape(-1)
-        batch_features = self.features_loader.load_batch(batch_ids)
-        batch_features = batch_features.reshape(self.batch_size, 2, *self.features_size)
+        batch_features = self.load_batch(batch_ids)
+        batch_features = batch_features.reshape(
+            self.batch_size, 2, *self.features_loader.target_size
+        )
         return batch_features
 
     def __iter__(self):
@@ -120,20 +70,32 @@ class TrainLoader:
 
 
 class TestLoader:
-    def __init__(self, features_loader, batch_size=256, features_size=(512, 60)):
+    def __init__(self, df, features_loader, batch_size=256, device="cpu"):
+        self.df = df
         self.features_loader = features_loader
         self.batch_size = batch_size
-        self.features_size = features_size
+        self.device = device
+        if "path" not in self.df.columns:
+            self.df["path"] = self.df["archive_features_path"].apply(
+                lambda x: os.path.join("/app/_data/artist_data/", "test_features", x)
+            )
+        self.track2path = self.df.set_index("trackid")["path"].to_dict()
+
+    def load_batch(self, paths):
+        batch = [self.features_loader.load_img(path) for path in paths]
+        return torch.tensor(np.array(batch)).to(self.device)
 
     def __iter__(self):
-        batch_ids = []
-        for track_id in tqdm(self.features_loader.df["trackid"].values):
+        batch_ids, paths = [], []
+        for track_id in tqdm(self.df.trackid.tolist()):
+            path = self.track2path[track_id]
             batch_ids.append(track_id)
+            paths.append(path)
             if len(batch_ids) == self.batch_size:
-                yield batch_ids, self.features_loader.load_batch(batch_ids)
-                batch_ids = []
+                yield batch_ids, self.load_batch(paths)
+                batch_ids, paths = [], []
         if len(batch_ids) > 0:
-            yield batch_ids, self.features_loader.load_batch(batch_ids)
+            yield batch_ids, self.load_batch(paths)
 
 
 class Custom_Loss(nn.Module):
@@ -173,70 +135,10 @@ class Custom_Loss(nn.Module):
         return loss
 
 
-def get_ranked_list(embeds, top_size=100, annoy_num_trees=128):
-    annoy_index = None
-    annoy2id = []
-    id2annoy = dict()
-    for track_id, track_embed in tqdm(embeds.items()):
-        id2annoy[track_id] = len(annoy2id)
-        annoy2id.append(track_id)
-        if annoy_index is None:
-            annoy_index = annoy.AnnoyIndex(len(track_embed), "angular")
-        annoy_index.add_item(id2annoy[track_id], track_embed)
-    annoy_index.build(annoy_num_trees, n_jobs=-1)
-    ranked_list = dict()
-    for track_id in tqdm(embeds.keys()):
-        candidates = annoy_index.get_nns_by_item(id2annoy[track_id], top_size + 1)[1:]
-        candidates = list(filter(lambda x: x != id2annoy[track_id], candidates))
-        ranked_list[track_id] = [annoy2id[candidate] for candidate in candidates]
-    return ranked_list
-
-
-def position_discounter(position):
-    return 1.0 / np.log2(position + 1)
-
-
-def get_ideal_dcg(relevant_items_count, top_size):
-    dcg = 0.0
-    for result_indx in range(min(top_size, relevant_items_count)):
-        position = result_indx + 1
-        dcg += position_discounter(position)
-    return dcg
-
-
-def compute_dcg(query_trackid, ranked_list, track2artist, top_size):
-    query_artistid = track2artist[query_trackid]
-    dcg = 0.0
-    for result_indx, result_trackid in enumerate(ranked_list[:top_size]):
-        assert result_trackid != query_trackid
-        position = result_indx + 1
-        discounted_position = position_discounter(position)
-        result_artistid = track2artist[result_trackid]
-        if result_artistid == query_artistid:
-            dcg += discounted_position
-    return dcg
-
-
-def eval_submission(submission, df, top_size=100):
-    track2artist = df.set_index("trackid")["artistid"].to_dict()
-    artist2tracks = df.groupby("artistid").agg(list)["trackid"].to_dict()
-    ndcg_list = []
-    for query_trackid in tqdm(submission.keys()):
-        ranked_list = submission[query_trackid]
-        query_artistid = track2artist[query_trackid]
-        query_artist_tracks_count = len(artist2tracks[query_artistid])
-        ideal_dcg = get_ideal_dcg(query_artist_tracks_count - 1, top_size=top_size)
-        dcg = compute_dcg(query_trackid, ranked_list, track2artist, top_size=top_size)
-        try:
-            ndcg_list.append(dcg / ideal_dcg)
-        except ZeroDivisionError:
-            continue
-    return np.mean(ndcg_list)
-
-
 class BaseModel(nn.Module):
     def __init__(
         self,
+        img_size,
         output_features_size1=512,
         output_features_size2=128,
         embed_len=128,
@@ -245,8 +147,9 @@ class BaseModel(nn.Module):
         super().__init__()
         self.output_features_size = output_features_size1 + output_features_size2
         self.embed_len = embed_len
+        self.img_size = img_size
         self.conv_1 = nn.Conv1d(
-            512, output_features_size1, kernel_size=kernel_size, padding=1
+            self.img_size[0], output_features_size1, kernel_size=kernel_size, padding=1
         )
         self.conv_2 = nn.Conv1d(
             output_features_size1,
@@ -256,7 +159,7 @@ class BaseModel(nn.Module):
         )
         self.mp_1 = nn.MaxPool1d(2)
         self.conv_1_2 = nn.Conv1d(
-            60, output_features_size2, kernel_size=kernel_size, padding=1
+            self.img_size[1], output_features_size2, kernel_size=kernel_size, padding=1
         )
         self.conv_2_2 = nn.Conv1d(
             output_features_size2,
@@ -269,18 +172,21 @@ class BaseModel(nn.Module):
             nn.Linear(self.output_features_size, self.output_features_size, bias=False),
             nn.ReLU(),
             nn.Linear(self.output_features_size, self.embed_len, bias=False),
+            nn.ReLU(),
+            nn.Linear(self.embed_len, self.embed_len, bias=False),
         )
 
     def forward(self, x):
         y = x.transpose(2, 1)
-        x = F.relu(self.conv_1(x))
-        x = F.relu(self.conv_2(x))
+        x = nn.ReLU()(self.conv_1(x))
+        x = nn.ReLU()(self.conv_2(x))
         x = self.mp_1(x).mean(axis=2)
 
-        y = F.relu(self.conv_1_2(y))
-        y = F.relu(self.conv_2_2(y))
+        y = nn.ReLU()(self.conv_1_2(y))
+        y = nn.ReLU()(self.conv_2_2(y))
         y = self.mp_1_2(y).mean(axis=2)
         output = torch.cat([x, y], axis=-1)
+        # output = F.normalize(output, p=2.0, dim=1)
         output = self.linear(output)
 
         return output
@@ -369,7 +275,7 @@ def train(
         with torch.no_grad():
             print("\nValidation nDCG on epoch {}".format(epoch + 1))
             embeds = inference(model, val_loader)
-            ranked_list = get_ranked_list(embeds, top_size, 128)
+            ranked_list = get_ranked_list(embeds, top_size, 128, "angular")
             val_ndcg = eval_submission(ranked_list, val_df)
             metrics["ndcg"].append(val_ndcg)
             print(f"ndcg = {val_ndcg} at {epoch + 1} epoch")
@@ -419,6 +325,16 @@ def main():
         const=0,
         type=int,
         default=0,
+    )
+    parser.add_argument(
+        "--img-size",
+        dest="img_size",
+        action="store",
+        required=False,
+        nargs="?",
+        const=(512, 81),
+        type=int,
+        default=(512, 81),
     )
     parser.add_argument(
         "--batch-size",
@@ -513,8 +429,9 @@ def main():
     torch.backends.cudnn.deterministic = True
 
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
+    IMG_SIZE = args.img_size
     BATCH_SIZE = args.batch_size
+
     LR = 1e-4
     TRAINSET_PATH = os.path.join(args.base_dir, "train_features")
     TESTSET_PATH = os.path.join(args.base_dir, "test_features")
@@ -532,7 +449,9 @@ def main():
     ) as f:
         json.dump(args.__dict__, f)
 
-    model = BaseModel(args.n_channels, 128, args.emb_len, args.kernel_size).to(DEVICE)
+    model = BaseModel(
+        IMG_SIZE, args.n_channels, 128, args.emb_len, args.kernel_size
+    ).to(DEVICE)
 
     df = pd.read_csv(TRAINSET_META_PATH, sep="\t")
     test_df = pd.read_csv(TESTSET_META_PATH, sep="\t")
@@ -542,27 +461,33 @@ def main():
     print("Train set size: {}".format(len(train_df)))
     print("Validation set size: {}".format(len(val_df)))
     print("Test set size: {}".format(len(test_df)))
-    print()
-    print("Train")
+    print("\nTrain")
+
     train(
         model=model,
         train_loader=TrainLoader(
-            FeaturesLoader(
-                features_dir_path=TRAINSET_PATH,
-                df=train_df,
-                device=DEVICE,
+            df=train_df,
+            features_loader=ImageLoader(
+                target_size=IMG_SIZE,
                 augment=True,
+                center_crop=False,
+                norm=False,
+                n_channels=None,
             ),
             batch_size=BATCH_SIZE,
+            device=DEVICE,
         ),
         val_loader=TestLoader(
-            FeaturesLoader(
-                features_dir_path=TRAINSET_PATH,
-                df=val_df,
-                device=DEVICE,
+            df=val_df,
+            features_loader=ImageLoader(
+                target_size=IMG_SIZE,
                 augment=False,
+                center_crop=False,
+                norm=False,
+                n_channels=None,
             ),
             batch_size=BATCH_SIZE,
+            device=DEVICE,
         ),
         val_df=val_df,
         optimizer=torch.optim.Adam(model.parameters(), lr=LR),
@@ -576,14 +501,18 @@ def main():
 
     print("\nSubmission")
     test_loader = TestLoader(
-        FeaturesLoader(
-            features_dir_path=TESTSET_PATH,
-            df=test_df,
-            device=DEVICE,
+        df=test_df,
+        features_loader=ImageLoader(
+            target_size=IMG_SIZE,
             augment=False,
+            center_crop=False,
+            norm=False,
+            n_channels=None,
         ),
         batch_size=BATCH_SIZE,
+        device=DEVICE,
     )
+
     model.to(DEVICE)
     model.load_state_dict(torch.load(CHECKPOINT_PATH))
     model.eval()
